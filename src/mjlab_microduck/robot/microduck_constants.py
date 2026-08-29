@@ -18,6 +18,8 @@ MICRODUCK_WALK_XML: Path = _ROBOT_DIR / "robot_walk.xml"
 MICRODUCK_ALLCOLLISIONS_XML: Path = _ROBOT_DIR / "robot_allcollisions.xml"
 # 70mm / 15g ball prop for the BallKick task.
 MICRODUCK_BALL_XML: Path = _ROBOT_DIR / "ball.xml"
+# 30x30x24mm / 30g graspable block for the GraspLift task.
+MICRODUCK_TOY_XML: Path = _ROBOT_DIR / "toy.xml"
 # Roller-skate model: 14 actuated joints + passive wheel hinges (passive_*wheel).
 MICRODUCK_ALLCOLLISIONS_ROLLERS_XML: Path = _ROBOT_DIR / "robot_allcollisions_rollers.xml"
 # Backlash models: every servo joint gets an unactuated passive_<joint>_backlash
@@ -30,6 +32,7 @@ MICRODUCK_ALLCOLLISIONS_ROLLERS_BACKLASH_XML: Path = _ROBOT_DIR / "robot_allcoll
 assert MICRODUCK_WALK_XML.exists(), f"XML not found: {MICRODUCK_WALK_XML}"
 assert MICRODUCK_ALLCOLLISIONS_XML.exists(), f"XML not found: {MICRODUCK_ALLCOLLISIONS_XML}"
 assert MICRODUCK_BALL_XML.exists(), f"XML not found: {MICRODUCK_BALL_XML}"
+assert MICRODUCK_TOY_XML.exists(), f"XML not found: {MICRODUCK_TOY_XML}"
 assert MICRODUCK_ALLCOLLISIONS_ROLLERS_XML.exists(), f"XML not found: {MICRODUCK_ALLCOLLISIONS_ROLLERS_XML}"
 assert MICRODUCK_ALLCOLLISIONS_BACKLASH_XML.exists(), f"XML not found: {MICRODUCK_ALLCOLLISIONS_BACKLASH_XML}"
 assert MICRODUCK_WALK_BACKLASH_XML.exists(), f"XML not found: {MICRODUCK_WALK_BACKLASH_XML}"
@@ -56,6 +59,14 @@ def get_walk_rollers_spec() -> mujoco.MjSpec:
 
 def get_ball_spec() -> mujoco.MjSpec:
     return mujoco.MjSpec.from_file(str(MICRODUCK_BALL_XML))
+
+
+def get_toy_spec() -> mujoco.MjSpec:
+    return mujoco.MjSpec.from_file(str(MICRODUCK_TOY_XML))
+
+
+def get_grasp_lift_spec() -> mujoco.MjSpec:
+    return mujoco.MjSpec.from_file(str(MICRODUCK_ALLCOLLISIONS_XML))
 
 
 def get_backlash_spec() -> mujoco.MjSpec:
@@ -232,6 +243,28 @@ MICRODUCK_ROLLERS_BACKLASH_ROBOT_CFG = EntityCfg(
 MICRODUCK_BALL_CFG = EntityCfg(
     spec_fn=get_ball_spec,
     init_state=EntityCfg.InitialStateCfg(pos=(0.3, 0.0, 0.035)),
+)
+
+# Free-floating, non-articulated graspable block for the GraspLift task. Position
+# is set each episode by the reset_toy_on_ground event; the init pos here only
+# matters for the pristine pre-first-reset state and is the nominal in-reach spawn
+# (x = 80mm ahead, resting on the floor at half-height z = 12mm).
+MICRODUCK_TOY_CFG = EntityCfg(
+    spec_fn=get_toy_spec,
+    init_state=EntityCfg.InitialStateCfg(pos=(0.08, 0.0, 0.012)),
+)
+
+# Full-collision robot for the GraspLift task. Same model as standup/ground-pick
+# (the head must be able to contact the toy, and the toy must be able to contact
+# the whole body), kept as its own name so the task's robot can diverge later.
+MICRODUCK_GRASP_LIFT_ROBOT_CFG = EntityCfg(
+    spec_fn=get_grasp_lift_spec,
+    init_state=HOME_FRAME,
+    collisions=(FULL_COLLISION,),
+    articulation=EntityArticulationInfoCfg(
+        actuators=(actuators,),
+        soft_joint_pos_limit_factor=0.9,
+    ),
 )
 
 # Roller skate robot: the 4 passive wheel joints (passive_*wheel) have no XML

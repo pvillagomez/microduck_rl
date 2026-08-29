@@ -1,0 +1,35 @@
+<mujoco model="microduck_toy">
+    <compiler angle="radian" autolimits="true"/>
+
+    <worldbody>
+        <!-- Graspable toy for the GraspLift task (Phase 1 of the toy-pickup roadmap).
+
+             Geometry: 30 x 30 x 24 mm block, 30 g nominal. A BOX (not a sphere like
+             ball.xml) on purpose: a rolling prop escapes the beak on first touch, which
+             turns "grasp" into "chase" and is not the skill being trained here. The
+             block also rests in a single stable pose, so the reset spawn is repeatable.
+
+             Size is set by the measured mouth reach: with both feet grounded, mouth_tip
+             bottoms out at z ~= 13 mm (at x ~= 68 mm in the yaw frame). A 24 mm-tall
+             block centers at z = 12 mm, so the mouth tip can actually reach the grasp
+             point instead of stopping above it.
+
+             Inertia is the exact uniform-density box tensor for m = 0.03 kg and full
+             extents (0.03, 0.03, 0.024):
+               Ixx = Iyy = m(0.03^2 + 0.024^2)/12 = 3.690e-6
+               Izz       = m(0.03^2 + 0.03^2)/12  = 4.500e-6
+             Stated explicitly (rather than left to inertiafromgeom) so tests can assert
+             it, and so dr.pseudo_inertia scales a known baseline. Keep it in sync with
+             TOY_MASS_KG / TOY_HALF_EXTENTS in microduck_grasp_lift_env_cfg.py.
+
+             friction = (sliding, torsional, rolling): high sliding friction models a
+             foam/rubber toy that grips the floor rather than skating away when nudged.
+        -->
+        <body name="toy" pos="0.08 0 0.012">
+            <freejoint name="toy_free"/>
+            <inertial pos="0 0 0" mass="0.03" diaginertia="3.690e-6 3.690e-6 4.500e-6"/>
+            <geom type="box" name="toy_geom" size="0.015 0.015 0.012" rgba="0.2 0.8 0.35 1"
+                  friction="1.0 0.01 0.001" condim="3"/>
+        </body>
+    </worldbody>
+</mujoco>

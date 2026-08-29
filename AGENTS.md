@@ -17,6 +17,7 @@ uv run train <TASK_ID> --env.scene.num-envs 64 --agent.max_iterations 5   # SMOK
 uv run play <TASK_ID> --wandb-run-path <entity/project/run_id>
 uv run scripts/export.py <TASK_ID> --wandb-run-path <...>   # → ONNX (bakes obs normalizer — mandatory path)
 uv run scripts/infer_policy.py --walking out.onnx   # CPU MuJoCo deployment rehearsal
+uv run scripts/payload_sweep.py                     # CPU: max beak payload (torque + CoM shift)
 uv run --with pytest pytest tests/
 ```
 
@@ -34,9 +35,10 @@ Never launch a long run without one.
 - `src/mjlab_microduck/tasks/backlash.py` — wraps any env cfg into its backlash twin.
 - `src/mjlab_microduck/robot/microduck_constants.py` — robot cfgs, HOME frame, BAM actuator cfg.
 - `src/mjlab_microduck/robot/microduck/` — MJCF exports from Onshape
-  (onshape-to-robot, one `config_mjcf_*.json` per model) + scenes + `add_backlash.py`.
+  (onshape-to-robot, one `config_mjcf_*.json` per model) + scenes + `add_backlash.py`
+  + props (`ball.xml` for BallKick, `toy.xml` for GraspLift).
 - `src/mjlab_microduck/actuator/friction_dr_bam.py` — BAM actuator + friction DR + backlash encoder.
-- `scripts/` — export, infer, sim2real comparison, wandb helpers.
+- `scripts/` — export, infer, sim2real comparison, payload feasibility, wandb helpers.
 - `tests/` — cfg-invariant and mdp-function regression tests (CPU, no GPU needed).
 
 ## Invariants — do not break these
@@ -76,6 +78,19 @@ Never launch a long run without one.
   is punished for correcting what it sees.
 - `-Backlash-` task variants must mirror their base task's robot model
   (walk / allcollisions / rollers) so backlash A/B comparisons are unconfounded.
+- **There is no jaw servo.** The 14 actuated joints are 5+5 leg and 4 neck/head;
+  the beak geoms (`jaw`, `bottom_head_shell`) are rigidly fixed to the `jaw_soft`
+  head body. Nothing can be "gripped" by an action. GraspLift models a grasp as a
+  latched `mjEQ_WELD` between head and object, added to the compiled scene via
+  `SceneCfg.spec_fn` (the only hook where two entities exist in one spec, addressed
+  under their `"<entity>/"` prefixes) and toggled per-env through
+  `d.eq_active[world, eq]`. Two traps: `m.eq_data` ships as ONE shared row, so a
+  task writing per-env weld poses must declare it via
+  `@requires_model_fields("eq_data")` on a registered event or every env silently
+  gets env 0's grasp; and sensor data (e.g. contact `found`) is a snapshot
+  refreshed by `scene.update()` in the decimation loop, NOT by `sim.forward()` —
+  so a contact gate cannot be verified by calling `forward()` and reading the
+  sensor, only by stepping the env.
 
 ## Building a new env — the workflow
 

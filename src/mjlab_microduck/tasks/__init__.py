@@ -35,6 +35,10 @@ from .microduck_ball_kick_env_cfg import (
     make_microduck_ball_kick_env_cfg,
     MicroduckBallKickRlCfg,
 )
+from .microduck_grasp_lift_env_cfg import (
+    make_microduck_grasp_lift_env_cfg,
+    MicroduckGraspLiftRlCfg,
+)
 from .microduck_sitstand_env_cfg import (
     make_microduck_sitstand_env_cfg,
     MicroduckSitStandRlCfg,
@@ -161,6 +165,18 @@ register_mjlab_task(
     env_cfg=make_microduck_ground_pick_env_cfg(rough=True),
     play_env_cfg=make_microduck_ground_pick_env_cfg(play=True, rough=True),
     rl_cfg=MicroduckGroundPickRlCfg,
+    runner_cls=MicroduckOnPolicyRunner,
+)
+
+# GraspLift task — roadmap Phase 1: crouch, close the beak on a block on the
+# floor (a real mjEQ_WELD grasp, not ground-pick's simulated payload force) and
+# stand back up holding it. Flat terrain only: a toy on generated rough terrain
+# has no known spawn height.
+register_mjlab_task(
+    task_id="Mjlab-GraspLift-Flat-MicroDuck",
+    env_cfg=make_microduck_grasp_lift_env_cfg(),
+    play_env_cfg=make_microduck_grasp_lift_env_cfg(play=True),
+    rl_cfg=MicroduckGraspLiftRlCfg,
     runner_cls=MicroduckOnPolicyRunner,
 )
 
