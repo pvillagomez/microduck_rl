@@ -7421,6 +7421,40 @@ def reset_toy_on_ground(
     _toy_prev_height(env)[env_ids] = pose[:, 2]
 
 
+def _grasp_weld_data(
+    q_head: torch.Tensor,
+    x_head: torch.Tensor,
+    q_toy: torch.Tensor,
+    x_toy: torch.Tensor,
+) -> torch.Tensor:
+    """Build the ``eq_data`` row that welds the toy where it currently sits.
+
+    Returns ``(N, 11)`` laid out as MuJoCo expects for ``mjEQ_WELD``:
+    ``[anchor(3) | relpose_pos(3) | relpose_quat(4) | torquescale(1)]``.
+
+    MuJoCo resolves a weld as::
+
+        pos1 = x_head + R_head @ data[3:6]      # the point, in body1 coords
+        pos2 = x_toy  + R_toy  @ data[0:3]      # the same point, in body2 coords
+        residual: pos1 == pos2  and  q_head * data[6:10] == q_toy
+
+    so anchoring at the toy's own origin (``data[0:3] = 0``) makes ``pos2 = x_toy``,
+    and ``data[3:6] = R_head^T (x_toy - x_head)`` makes ``pos1 = x_toy`` too. The
+    relative quaternion ``q_head^-1 q_toy`` satisfies the orientation half.
+
+    Split out of ``update_grasp_latch`` so the maths is directly testable: a test
+    that re-derives these terms independently would still pass if the shipped
+    call site were wrong.
+    """
+    n = q_head.shape[0]
+    data = torch.zeros(n, 11, device=q_head.device, dtype=x_head.dtype)
+    data[:, 0:3] = 0.0
+    data[:, 3:6] = quat_apply_inverse(q_head, x_toy - x_head)
+    data[:, 6:10] = quat_mul(quat_inv(q_head), q_toy)
+    data[:, 10] = 1.0
+    return data
+
+
 def update_grasp_latch(
     env: ManagerBasedRlEnv,
     env_ids: torch.Tensor,
@@ -7510,10 +7544,9 @@ def update_grasp_latch(
     q_toy = env.sim.data.xquat[ids, toy_bid]
 
     eq_data = env.sim.model.eq_data
-    eq_data[ids, eq_id, 0:3] = 0.0
-    eq_data[ids, eq_id, 3:6] = quat_apply_inverse(q_head, x_toy - x_head)
-    eq_data[ids, eq_id, 6:10] = quat_mul(quat_inv(q_head), q_toy)
-    eq_data[ids, eq_id, 10] = 1.0
+    eq_data[ids, eq_id] = _grasp_weld_data(q_head, x_head, q_toy, x_toy).to(
+        eq_data.dtype
+    )
 
     env.sim.data.eq_active[ids, eq_id] = True
     held[ids] = True
