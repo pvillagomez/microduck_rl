@@ -398,20 +398,86 @@ def test_payload_penalty_is_free_during_normal_motion_and_bites_when_flung():
         for _ in range(3):
             env.step(action)
 
+        def force_accel(delta_v: float):
+            """Set up a known acceleration for the CURRENT step."""
+            _carry_prev_toy_vel(env)[:] = toy.data.root_link_lin_vel_w
+            _carry_prev_toy_vel(env)[:, 0] -= delta_v
+            # The env's own managers already cached this step's acceleration;
+            # drop it so the poked buffer is what gets differenced.
+            if hasattr(env, "_carry_accel_cache"):
+                del env._carry_accel_cache
+
         # Gentle: a velocity change well under free_accel * dt costs nothing.
-        gentle = 0.5 * PAYLOAD_FREE_ACCEL * env.step_dt
-        _carry_prev_toy_vel(env)[:] = toy.data.root_link_lin_vel_w
-        _carry_prev_toy_vel(env)[:, 0] -= gentle
+        force_accel(0.5 * PAYLOAD_FREE_ACCEL * env.step_dt)
         assert bool(
             (carried_toy_accel_penalty(env) == 0.0).all()
         ), "normal-gait payload motion must be free"
 
         # Violent: several times the hinge must cost.
-        violent = 5.0 * PAYLOAD_FREE_ACCEL * env.step_dt
-        _carry_prev_toy_vel(env)[:] = toy.data.root_link_lin_vel_w
-        _carry_prev_toy_vel(env)[:, 0] -= violent
+        force_accel(5.0 * PAYLOAD_FREE_ACCEL * env.step_dt)
         assert bool(
             (carried_toy_accel_penalty(env) < 0.0).all()
         ), "flinging the toy must cost"
+    finally:
+        env.close()
+
+
+def test_payload_diagnostics_are_not_dead():
+    """Both metrics must report the REAL acceleration, not a constant zero.
+
+    mjlab computes rewards BEFORE metrics. The first implementation had each of the
+    three terms difference one shared previous-velocity buffer, so the penalty
+    consumed it and both metrics then measured ``vel - vel == 0`` forever.
+
+    This is not hypothetical — it shipped to the first Carry smoke test, which
+    reported ``carried_toy_accel = 0.0000`` and ``carried_toy_grip_force =
+    0.38 N``. That force is exactly (mean randomized toy mass) x 9.81, i.e. the
+    payload's static weight with the entire dynamic term missing, and it reads like
+    a perfectly healthy number. Instrumentation that always returns zero is worse
+    than no instrumentation, because the whole point of these two metrics is to
+    replace a guessed ``free_accel`` with a measured distribution.
+    """
+    from mjlab_microduck.tasks.mdp import (
+        carried_toy_accel,
+        carried_toy_accel_penalty,
+        carried_toy_grip_force,
+    )
+
+    env = _carry_env(num_envs=4)
+    try:
+        env.reset()
+        gen = torch.Generator().manual_seed(0)
+        peak_accel = 0.0
+        peak_force = 0.0
+        static_weight = 0.0
+        for _ in range(25):
+            action = 0.8 * torch.randn(
+                env.num_envs, env.action_manager.total_action_dim, generator=gen
+            )
+            env.step(action)
+            # Read them the way the env does: rewards first, then metrics. Under
+            # the shared-buffer bug this ordering is exactly what zeroed them.
+            pen = carried_toy_accel_penalty(env)
+            accel = carried_toy_accel(env)
+            force = carried_toy_grip_force(env)
+
+            assert bool((pen <= 0.0).all()), "penalty must never pay"
+            peak_accel = max(peak_accel, float(accel.max()))
+            peak_force = max(peak_force, float(force.max()))
+
+            toy = env.scene["toy"]
+            body_mass = env.sim.model.body_mass
+            bid = int(toy.indexing.root_body_id)
+            mass = body_mass[:, bid] if body_mass.dim() > 1 else body_mass[bid]
+            static_weight = float((mass * 9.81).max())
+
+        assert peak_accel > 1.0, (
+            f"carried_toy_accel never left zero (peak {peak_accel:.4f} m/s^2) — the "
+            "metric is dead and cannot inform PAYLOAD_FREE_ACCEL"
+        )
+        assert peak_force > static_weight * 1.05, (
+            f"carried_toy_grip_force peaked at {peak_force:.4f} N vs a static "
+            f"weight of {static_weight:.4f} N — the dynamic term is missing"
+        )
     finally:
         env.close()

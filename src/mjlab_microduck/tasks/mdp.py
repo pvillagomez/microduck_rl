@@ -7869,6 +7869,48 @@ def attach_toy_to_beak(
     _carry_prev_toy_vel(env)[env_ids] = 0.0
 
 
+def _carry_toy_accel(
+    env: ManagerBasedRlEnv,
+    asset_name: str = "toy",
+) -> torch.Tensor:
+    """Carried toy's linear acceleration this step, computed ONCE and shared.
+
+    The previous-velocity buffer must advance exactly once per step, but three
+    different terms want the acceleration: the violence penalty and the two
+    diagnostic metrics. mjlab computes rewards BEFORE metrics
+    (``reward_manager.compute()`` then ``metrics_manager.compute()``), so when
+    each term differenced the shared buffer itself, the penalty consumed it and
+    both metrics then measured ``vel - vel == 0`` forever.
+
+    That is not a hypothetical: the first Carry smoke test logged
+    ``carried_toy_accel = 0.0000`` and ``carried_toy_grip_force = 0.38 N``, which
+    is exactly (mean randomized toy mass) x g — the static weight, with the entire
+    dynamic term silently missing. Instrumentation that always reads zero is worse
+    than none, because it reads like a clean result.
+
+    Caching on ``common_step_counter`` makes the first caller in a step do the
+    differencing and everyone else reuse it, so the buffer advances once no matter
+    which terms are enabled or what order they run in.
+    """
+    step = int(env.common_step_counter)
+    cached = getattr(env, "_carry_accel_cache", None)
+    if cached is not None and cached[0] == step:
+        return cached[1]
+
+    toy: Entity = env.scene[asset_name]
+    vel = torch.nan_to_num(toy.data.root_link_lin_vel_w, nan=0.0)
+    prev = _carry_prev_toy_vel(env)
+    accel = (vel - prev) / max(float(env.step_dt), 1e-6)
+    prev[:] = vel
+    # A reset teleports the toy to the beak, which differences into a huge
+    # spurious acceleration on the first step of every episode.
+    fresh = env.episode_length_buf <= 1
+    accel = torch.where(fresh.unsqueeze(-1), torch.zeros_like(accel), accel)
+
+    env._carry_accel_cache = (step, accel)
+    return accel
+
+
 def carried_toy_accel_penalty(
     env: ManagerBasedRlEnv,
     asset_name: str = "toy",
@@ -7899,18 +7941,9 @@ def carried_toy_accel_penalty(
     ``max_accel`` clips the per-step contribution so a solver spike cannot deliver
     an unbounded punishment.
     """
-    toy: Entity = env.scene[asset_name]
-    vel = torch.nan_to_num(toy.data.root_link_lin_vel_w, nan=0.0)
-    prev = _carry_prev_toy_vel(env)
-    accel = (vel - prev) / max(float(env.step_dt), 1e-6)
-    prev[:] = vel
-    # A reset teleports the toy, which reads as a huge spurious acceleration.
-    fresh = env.episode_length_buf <= 1
-    mag = torch.linalg.norm(accel, dim=-1)
+    mag = torch.linalg.norm(_carry_toy_accel(env, asset_name), dim=-1)
     mag = torch.nan_to_num(mag, nan=0.0, posinf=max_accel, neginf=0.0)
-    excess = (mag - free_accel).clamp(0.0, max_accel)
-    excess = torch.where(fresh, torch.zeros_like(excess), excess)
-    return -excess
+    return -(mag - free_accel).clamp(0.0, max_accel)
 
 
 def carried_toy_accel(
@@ -7921,14 +7954,9 @@ def carried_toy_accel(
 
     Logged so the first carry run MEASURES the acceleration distribution a real
     gait produces, instead of the ``free_accel`` hinge in
-    ``carried_toy_accel_penalty`` being guessed forever. Read-only: it reuses the
-    penalty's previous-velocity buffer rather than keeping its own, so it must be
-    evaluated in the same step as the penalty (both run once per step).
+    ``carried_toy_accel_penalty`` being guessed forever.
     """
-    toy: Entity = env.scene[asset_name]
-    vel = torch.nan_to_num(toy.data.root_link_lin_vel_w, nan=0.0)
-    accel = (vel - _carry_prev_toy_vel(env)) / max(float(env.step_dt), 1e-6)
-    mag = torch.linalg.norm(accel, dim=-1)
+    mag = torch.linalg.norm(_carry_toy_accel(env, asset_name), dim=-1)
     return torch.nan_to_num(mag, nan=0.0, posinf=0.0, neginf=0.0)
 
 
@@ -7945,10 +7973,12 @@ def carried_toy_grip_force(
     Pancha ships and beak grip strength is measurable (roadmap Phase 6), comparing
     it against this distribution answers whether the trained gait is carryable
     without ever having to invent a release threshold here.
+
+    Sanity check when reading it: with the toy at rest this equals m*g, so a run
+    reporting exactly (mean toy mass) x 9.81 means the dynamic term is missing.
     """
     toy: Entity = env.scene[asset_name]
-    vel = torch.nan_to_num(toy.data.root_link_lin_vel_w, nan=0.0)
-    accel = (vel - _carry_prev_toy_vel(env)) / max(float(env.step_dt), 1e-6)
+    accel = _carry_toy_accel(env, asset_name)
     # Subtract gravity: a body held at rest still needs m*g of grip.
     gravity = torch.zeros(1, 3, device=env.device, dtype=accel.dtype)
     gravity[0, 2] = -9.81
