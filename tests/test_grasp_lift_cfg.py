@@ -8,6 +8,7 @@ beak. The physics of the weld itself is checked in
 """
 
 import math
+from pathlib import Path
 
 import mujoco
 import numpy as np
@@ -319,3 +320,87 @@ def test_grasp_weld_holds_object():
     for _ in range(1500):
         mujoco.mj_step(model, data)
     assert data.xpos[toy][2] < 0.03, "toy did not fall after the weld was released"
+
+
+# ── Backlash variant ─────────────────────────────────────────────────────────
+
+
+def test_backlash_variant_keeps_toy_and_weld():
+    """The backlash twin must keep the toy entity AND a resolvable grasp weld.
+
+    ``make_backlash_variant`` swaps only the ``robot`` key, so a second entity and
+    ``scene.spec_fn`` survive by construction — but nothing else in the repo has a
+    multi-entity backlash task, so this locks that in. Compiling the scene is the
+    part that matters: the weld addresses bodies by prefixed name, so if the
+    backlash export ever renamed ``jaw_soft`` the equality would silently fail to
+    resolve and the task would train with no grasp at all.
+    """
+    from mjlab.scene import Scene, SceneCfg
+    from mjlab.tasks.registry import load_env_cfg
+    from mjlab.terrains.terrain_entity import TerrainEntityCfg
+
+    cfg = load_env_cfg("Mjlab-GraspLift-Flat-Backlash-MicroDuck")
+    # Robot MUST stay first: base reset events write robot root at qpos[:, 0:7].
+    assert list(cfg.scene.entities.keys()) == ["robot", "toy"]
+    assert cfg.scene.spec_fn is not None
+
+    model = Scene(
+        SceneCfg(
+            num_envs=1,
+            terrain=TerrainEntityCfg(terrain_type="plane"),
+            entities=cfg.scene.entities,
+            spec_fn=cfg.scene.spec_fn,
+        ),
+        device="cpu",
+    ).compile()
+
+    eq = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_EQUALITY, GRASP_WELD_NAME)
+    assert eq >= 0, "grasp weld did not resolve on the backlash model"
+    assert model.eq_obj1id[eq] == mujoco.mj_name2id(
+        model, mujoco.mjtObj.mjOBJ_BODY, "robot/jaw_soft"
+    )
+    assert model.eq_obj2id[eq] == mujoco.mj_name2id(
+        model, mujoco.mjtObj.mjOBJ_BODY, "toy/toy"
+    )
+    assert not model.eq_active0[eq]
+
+    # Backlash joints ride their hard limits by design and must be excluded from
+    # the soft-limit penalty, or it fires permanently.
+    assert cfg.rewards["dof_pos_limits"].params["asset_cfg"].joint_names == (
+        r"^(?!passive_).*",
+    )
+
+
+def test_backlash_variant_mirrors_base_robot_model():
+    """AGENTS.md invariant: a -Backlash- variant mirrors its base task's model.
+
+    GraspLift runs on allcollisions, so its twin must use the allcollisions
+    backlash robot — a walk-model twin would confound any backlash A/B with a
+    collision-model change.
+    """
+    from mjlab.tasks.registry import load_env_cfg
+
+    from mjlab_microduck.robot.microduck_constants import get_backlash_spec
+
+    cfg = load_env_cfg("Mjlab-GraspLift-Flat-Backlash-MicroDuck")
+    # load_env_cfg deep-copies, so identity against the cfg object is meaningless;
+    # spec_fn survives the copy and pins the actual XML that gets compiled.
+    assert cfg.scene.entities["robot"].spec_fn is get_backlash_spec
+
+
+def test_backlash_variant_preserves_the_61d_obs_contract():
+    """Obs/action dims must be unchanged: 14 servo joints, 61 D actor.
+
+    The backlash model carries 28 joints (14 servo + 14 passive backlash hinges);
+    if those leaked into the joint obs the actor would blow past 61 D and stop
+    being hot-swappable against the rest of the policy family.
+    """
+    from mjlab.tasks.registry import load_env_cfg
+
+    cfg = load_env_cfg("Mjlab-GraspLift-Flat-Backlash-MicroDuck")
+    for group in ("actor", "critic"):
+        for term in ("joint_pos", "joint_vel"):
+            sel = cfg.observations[group].terms[term].params["asset_cfg"].joint_names
+            assert sel == (r"^(?!passive_).*",), (
+                f"{group}.{term} would include the backlash hinges"
+            )
