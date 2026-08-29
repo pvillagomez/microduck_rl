@@ -1,6 +1,7 @@
 """MDP functions for microduck tasks"""
 
 import math
+import functools
 from dataclasses import dataclass as _dataclass
 
 import numpy as np
@@ -17,7 +18,15 @@ from mjlab.tasks.velocity.mdp import observations as _velocity_obs
 from mjlab.managers.command_manager import CommandTerm
 from mjlab.managers import CommandTermCfg
 from mjlab.managers.event_manager import requires_model_fields
-from mjlab.utils.lab_api.math import matrix_from_quat, wrap_to_pi, quat_apply, quat_from_angle_axis
+from mjlab.utils.lab_api.math import (
+    matrix_from_quat,
+    quat_apply,
+    quat_apply_inverse,
+    quat_from_angle_axis,
+    quat_inv,
+    quat_mul,
+    wrap_to_pi,
+)
 from rsl_rl.algorithms.ppo import PPO as _PPO
 
 # ---------------------------------------------------------------------------
@@ -7186,3 +7195,511 @@ def roulade_lateral_velocity_penalty(
     """Body-frame lateral (y) linear velocity² — keeps the roll straight."""
     asset: Entity = env.scene[asset_cfg.name]
     return torch.nan_to_num(asset.data.root_link_lin_vel_b[:, 1].pow(2), nan=0.0)
+
+
+# --------------------------------------------------------------------------- #
+# GraspLift (roadmap Phase 1) — grasp a real toy and lift it                    #
+# --------------------------------------------------------------------------- #
+# The Microduck has NO jaw servo: the 14 actuated joints are 5+5 leg and 4
+# neck/head, and the beak geoms (`jaw`, `bottom_head_shell`) are rigidly fixed to
+# the `jaw_soft` head body. "Closing the beak" is therefore not representable as
+# an action, and `ground_pick`'s `apply_mouth_payload_force` only fakes a payload
+# with an external wrench — nothing is ever actually held.
+#
+# The grasp is instead a LATCHED WELD: a 6-DoF `mjEQ_WELD` equality between the
+# head body and the toy body, declared inactive at compile time and switched on
+# per-env at runtime (`d.eq_active[world, eq]`) the first time the beak really
+# does close on the toy. Its `m.eq_data` row is written per-env at latch time so
+# the toy is welded exactly where it was caught (requires `eq_data` expanded
+# per-world — see `reset_grasp`'s `requires_model_fields`).
+#
+# The latch gate is deliberately PHYSICAL, not phase-based, so the policy cannot
+# earn a grasp by standing in the right place at the right time:
+#   1. a real contact between the head/neck subtree and the toy geom,
+#   2. mouth_tip within `radius` of the toy centre,
+#   3. the mouth axis pointing down (same alignment measure as ground_pick),
+#   4. low head-vs-toy relative speed — you cannot latch onto something you are
+#      in the middle of slapping away.
+# Condition 4 also removes the obvious reward hack: without it the cheapest
+# "grasp" is a fast head slam that happens to clip the toy on the way through.
+
+GRASP_WELD_NAME = "grasp_weld"
+
+
+def _add_grasp_weld_to_spec(
+    spec: mujoco.MjSpec,
+    head_body: str,
+    toy_body: str,
+    solref: tuple,
+    solimp: tuple,
+) -> None:
+    """Add the (inactive) grasp weld to a compiled-scene spec.
+
+    Used as ``SceneCfg.spec_fn``, which mjlab calls after every entity has been
+    attached — the only point at which both bodies exist in one spec. Entities are
+    attached under a ``"<entity_name>/"`` prefix, hence ``robot/jaw_soft`` and
+    ``toy/toy``.
+
+    ``solref``/``solimp`` are deliberately softer than a rigid weld: the real beak
+    is a compliant soft mouth, and an infinitely stiff constraint between a 190 g
+    head and a 30 g block is both unphysical and a stiff-solver hazard.
+    """
+    eq = spec.add_equality()
+    eq.name = GRASP_WELD_NAME
+    eq.type = mujoco.mjtEq.mjEQ_WELD
+    eq.objtype = mujoco.mjtObj.mjOBJ_BODY
+    eq.name1 = head_body
+    eq.name2 = toy_body
+    eq.active = False
+    eq.solref = np.asarray(solref, dtype=float)
+    eq.solimp = np.asarray(solimp, dtype=float)
+    # [anchor(3) | relpose_pos(3) | relpose_quat(4) | torquescale(1)].
+    # Placeholder identity; the real row is written per-env at latch time.
+    eq.data = np.array([0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0])
+
+
+def make_grasp_weld_spec_fn(
+    head_body: str = "robot/jaw_soft",
+    toy_body: str = "toy/toy",
+    solref: tuple = (0.01, 1.0),
+    solimp: tuple = (0.95, 0.99, 0.001, 0.5, 2.0),
+):
+    """Build the ``SceneCfg.spec_fn`` that installs the grasp weld."""
+    return functools.partial(
+        _add_grasp_weld_to_spec,
+        head_body=head_body,
+        toy_body=toy_body,
+        solref=solref,
+        solimp=solimp,
+    )
+
+
+def _grasp_eq_id(env: ManagerBasedRlEnv) -> int:
+    """Global equality index of the grasp weld (cached)."""
+    eq_id = getattr(env, "_grasp_eq_id_cache", None)
+    if eq_id is None:
+        eq_id = mujoco.mj_name2id(
+            env.sim.mj_model, mujoco.mjtObj.mjOBJ_EQUALITY, GRASP_WELD_NAME
+        )
+        if eq_id < 0:
+            raise RuntimeError(
+                f"Equality '{GRASP_WELD_NAME}' not found in the compiled model. "
+                "The GraspLift env must set scene.spec_fn = make_grasp_weld_spec_fn()."
+            )
+        env._grasp_eq_id_cache = eq_id
+    return eq_id
+
+
+def _grasp_flag(env: ManagerBasedRlEnv) -> torch.Tensor:
+    """Per-env bool: is the toy currently welded to the beak? (lazily allocated)"""
+    flag = getattr(env, "_grasp_held", None)
+    if flag is None:
+        flag = torch.zeros(env.num_envs, dtype=torch.bool, device=env.device)
+        env._grasp_held = flag
+    return flag
+
+
+def _grasp_engaged_now(env: ManagerBasedRlEnv) -> torch.Tensor:
+    """Per-env float: 1.0 only on the step the weld was engaged (lazily allocated)."""
+    buf = getattr(env, "_grasp_engaged_now", None)
+    if buf is None:
+        buf = torch.zeros(env.num_envs, device=env.device)
+        env._grasp_engaged_now = buf
+    return buf
+
+
+def _toy_spawn_pos(env: ManagerBasedRlEnv) -> torch.Tensor:
+    """Per-env toy spawn position in world frame (lazily allocated)."""
+    buf = getattr(env, "_toy_spawn_pos_w", None)
+    if buf is None:
+        buf = torch.zeros(env.num_envs, 3, device=env.device)
+        env._toy_spawn_pos_w = buf
+    return buf
+
+
+def _toy_prev_height(env: ManagerBasedRlEnv) -> torch.Tensor:
+    """Per-env toy height on the previous step, for potential-based lift shaping."""
+    buf = getattr(env, "_toy_prev_z", None)
+    if buf is None:
+        buf = torch.zeros(env.num_envs, device=env.device)
+        env._toy_prev_z = buf
+    return buf
+
+
+def _mouth_down_alignment(env: ManagerBasedRlEnv, asset_cfg: SceneEntityCfg) -> torch.Tensor:
+    """cos between the mouth site x-axis and world -Z. 1 = beak pointing straight down.
+
+    Same measure ``mouth_perpendicular_to_ground`` rewards, reused here as a latch
+    gate so the reward and the gate agree on what "mouth down" means.
+    """
+    asset: Entity = env.scene[asset_cfg.name]
+    q = asset.data.site_quat_w[:, asset_cfg.site_ids[0], :]
+    w, qx, qy, qz = q[:, 0], q[:, 1], q[:, 2], q[:, 3]
+    return -(2.0 * (qx * qz - w * qy))
+
+
+@requires_model_fields("eq_data")
+def reset_grasp(
+    env: ManagerBasedRlEnv,
+    env_ids: torch.Tensor,
+    asset_name: str = "toy",
+) -> None:
+    """Reset event: release the weld and clear all grasp bookkeeping.
+
+    Also carries the ``eq_data`` per-world expansion declaration for the whole
+    task: ``m.eq_data`` ships as a single shared row, so without this the weld
+    pose written for env 0 would be silently applied to every env (mjwarp indexes
+    it as ``eq_data[worldid % eq_data.shape[0]]``). mjlab only expands fields
+    declared by a registered event function, exactly like the BAM friction fields.
+    """
+    if env_ids is None:
+        env_ids = torch.arange(env.num_envs, device=env.device)
+    env_ids = env_ids.to(env.device)
+
+    env.sim.data.eq_active[env_ids, _grasp_eq_id(env)] = False
+    _grasp_flag(env)[env_ids] = False
+    _grasp_engaged_now(env)[env_ids] = 0.0
+    # Lift shaping baseline: reset to the toy's spawn height so the first post-reset
+    # step reports ~0 progress instead of a spurious jump from the last episode.
+    toy: Entity = env.scene[asset_name]
+    _toy_prev_height(env)[env_ids] = toy.data.root_link_pos_w[env_ids, 2]
+
+
+def reset_toy_on_ground(
+    env: ManagerBasedRlEnv,
+    env_ids: torch.Tensor,
+    offset: tuple = (0.08, 0.0),
+    noise_xy: float = 0.02,
+    yaw_noise: float = math.pi,
+    toy_half_height: float = 0.012,
+    asset_name: str = "toy",
+) -> None:
+    """Place the toy on the floor in front of the robot, in its yaw frame.
+
+    ``offset`` is the nominal toy-centre position in the robot's yaw frame. The
+    default x = 80mm sits inside the measured mouth reach envelope: with both feet
+    grounded the mouth tip bottoms out at z ~= 13mm at x ~= 68mm and still reaches
+    the floor out to x ~= 128mm, so 80mm +/- 20mm of placement noise stays reachable
+    at every sample.
+
+    ``noise_xy`` is the placement DR that makes the (toy-BLIND) policy robust to
+    real-world aiming error — the same role ``BALL_POS_NOISE_XY`` plays for the
+    kick. ``yaw_noise`` randomizes the block's heading about z; it is a squat box,
+    so yaw changes which face the beak meets without changing its rest height.
+
+    Reads the robot root straight out of qpos (``root_link_pos_w`` lags until the
+    next ``forward()``), so this must be registered AFTER ``reset_base`` /
+    ``set_ground_state`` — event terms fire in dict insertion order.
+    """
+    if env_ids is None or len(env_ids) == 0:
+        return
+    env_ids = env_ids.to(env.device)
+    robot: Entity = env.scene["robot"]
+    toy: Entity = env.scene[asset_name]
+
+    root = env.sim.data.qpos[env_ids][:, robot.indexing.free_joint_q_adr]
+    qw, qx, qy, qz = root[:, 3], root[:, 4], root[:, 5], root[:, 6]
+    yaw = torch.atan2(2.0 * (qw * qz + qx * qy), 1.0 - 2.0 * (qy * qy + qz * qz))
+    cos_y, sin_y = torch.cos(yaw), torch.sin(yaw)
+
+    n = len(env_ids)
+    off = torch.tensor(offset, device=env.device, dtype=torch.float).repeat(n, 1)
+    off += (torch.rand(n, 2, device=env.device) * 2.0 - 1.0) * noise_xy
+
+    pose = torch.zeros(n, 7, device=env.device)
+    pose[:, 0] = root[:, 0] + cos_y * off[:, 0] - sin_y * off[:, 1]
+    pose[:, 1] = root[:, 1] + sin_y * off[:, 0] + cos_y * off[:, 1]
+    pose[:, 2] = env.scene.terrain.env_origins[env_ids, 2] + toy_half_height
+    # Yaw-only orientation: the block rests flat, only its heading is randomized.
+    half = (torch.rand(n, device=env.device) * 2.0 - 1.0) * (yaw_noise * 0.5)
+    pose[:, 3] = torch.cos(half)
+    pose[:, 6] = torch.sin(half)
+    toy.write_root_link_pose_to_sim(pose, env_ids)
+    toy.write_root_link_velocity_to_sim(torch.zeros(n, 6, device=env.device), env_ids)
+
+    _toy_spawn_pos(env)[env_ids] = pose[:, :3]
+    _toy_prev_height(env)[env_ids] = pose[:, 2]
+
+
+def update_grasp_latch(
+    env: ManagerBasedRlEnv,
+    env_ids: torch.Tensor,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg(
+        "robot", body_names=["jaw_soft"], site_names=["mouth_tip"]
+    ),
+    asset_name: str = "toy",
+    sensor_name: str = "head_toy_contact",
+    radius: float = 0.035,
+    min_alignment: float = 0.3,
+    max_rel_speed: float = 0.35,
+) -> None:
+    """Step event: engage the grasp weld on every env whose beak just closed on the toy.
+
+    Runs in ``"step"`` mode, which mjlab fires AFTER ``sim.forward()`` — so site and
+    body poses are fresh, and the weld that is switched on here takes effect on the
+    next physics step.
+
+    One timing subtlety: mjlab sensor data is a snapshot refreshed by
+    ``scene.update()`` inside the decimation loop, NOT by the later
+    ``sim.forward()``. The contact flag read here is therefore from the final
+    physics substep, one substep behind the poses. That is the same consistent
+    staleness mjlab accepts for rewards and terminations, and it is harmless at
+    50 Hz against a near-stationary toy — but it does mean you cannot verify this
+    gate by calling ``sim.forward()`` and reading the sensor directly, only by
+    stepping the env.
+
+    Gate (all four must hold, and the env must not already be holding):
+      ``found``      a real contact between the head/neck subtree and the toy geom
+      ``radius``     mouth_tip within this distance of the toy centre
+      ``min_alignment``  mouth axis pointing downward (see ``_mouth_down_alignment``)
+      ``max_rel_speed``  head-vs-toy relative speed low enough that this is a grasp
+                         and not a slap. Without it the cheapest "grasp" the policy
+                         can find is a fast head slam that clips the toy in passing.
+
+    On latch, the weld's ``eq_data`` row is written so the toy is fixed at the pose
+    it had at that instant:
+      ``anchor``      = 0 -> the constrained point on the toy is its body origin
+      ``relpose_pos`` = R_head^T (x_toy - x_head), the same point in head coords
+      ``relpose_quat``= q_head^-1 * q_toy, so q_head * relpose == q_toy holds
+      ``torquescale`` = 1, a full 6-DoF weld (position AND orientation)
+    """
+    del env_ids  # "step" mode always fires on all envs
+
+    robot: Entity = env.scene[asset_cfg.name]
+    toy: Entity = env.scene[asset_name]
+    eq_id = _grasp_eq_id(env)
+    held = _grasp_flag(env)
+
+    mouth_pos = robot.data.site_pos_w[:, asset_cfg.site_ids[0], :]
+    toy_pos = toy.data.root_link_pos_w
+    dist = torch.linalg.norm(mouth_pos - toy_pos, dim=-1)
+
+    rel_speed = torch.linalg.norm(
+        robot.data.site_lin_vel_w[:, asset_cfg.site_ids[0], :]
+        - toy.data.root_link_lin_vel_w,
+        dim=-1,
+    )
+
+    touching = torch.zeros(env.num_envs, dtype=torch.bool, device=env.device)
+    if sensor_name in env.scene.sensors:
+        found = env.scene.sensors[sensor_name].data.found
+        if found.dim() > 1:
+            found = found.sum(dim=-1)
+        touching = found > 0
+
+    engage = (
+        (~held)
+        & touching
+        & (dist < radius)
+        & (_mouth_down_alignment(env, asset_cfg) >= min_alignment)
+        & (rel_speed < max_rel_speed)
+    )
+    engage &= torch.isfinite(dist) & torch.isfinite(rel_speed)
+
+    _grasp_engaged_now(env)[:] = engage.to(torch.float)
+    if not bool(engage.any()):
+        return
+
+    ids = engage.nonzero(as_tuple=False).squeeze(-1)
+    head_bid = int(robot.indexing.body_ids[asset_cfg.body_ids[0]])
+    toy_bid = int(toy.indexing.root_body_id)
+
+    x_head = env.sim.data.xpos[ids, head_bid]
+    q_head = env.sim.data.xquat[ids, head_bid]
+    x_toy = env.sim.data.xpos[ids, toy_bid]
+    q_toy = env.sim.data.xquat[ids, toy_bid]
+
+    eq_data = env.sim.model.eq_data
+    eq_data[ids, eq_id, 0:3] = 0.0
+    eq_data[ids, eq_id, 3:6] = quat_apply_inverse(q_head, x_toy - x_head)
+    eq_data[ids, eq_id, 6:10] = quat_mul(quat_inv(q_head), q_toy)
+    eq_data[ids, eq_id, 10] = 1.0
+
+    env.sim.data.eq_active[ids, eq_id] = True
+    held[ids] = True
+
+
+def release_grasp(
+    env: ManagerBasedRlEnv,
+    env_ids: torch.Tensor | None = None,
+) -> None:
+    """Release the weld on the given envs.
+
+    Not used by the Phase 1 reward stack (Phase 1 grasps and holds; commanded
+    release is roadmap Phase 3), but the counterpart to ``update_grasp_latch`` and
+    what a Phase 3 release skill will call.
+    """
+    if env_ids is None:
+        env_ids = torch.arange(env.num_envs, device=env.device)
+    env_ids = env_ids.to(env.device)
+    env.sim.data.eq_active[env_ids, _grasp_eq_id(env)] = False
+    _grasp_flag(env)[env_ids] = False
+
+
+# ── GraspLift rewards ──────────────────────────────────────────────────────── #
+
+
+def mouth_toy_proximity_phased(
+    env: ManagerBasedRlEnv,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot", site_names=["mouth_tip"]),
+    asset_name: str = "toy",
+    std: float = 0.10,
+    command_name: str = "twist",
+    descent_end: float = 0.375,
+    hold_end: float = 0.425,
+    rise_end: float = 0.80,
+) -> torch.Tensor:
+    """Gaussian on the mouth_tip-to-toy distance, gated on the descent+hold phase.
+
+    The GraspLift analogue of ``mouth_ground_proximity_phased``: the target is the
+    toy, not the floor, so the reward keeps paying when the toy is lifted off the
+    ground and does not fight ``head_impact_penalty``. ``std`` = 0.10 gives gradient
+    from ~20cm away, i.e. from the standing pose.
+    """
+    robot: Entity = env.scene[asset_cfg.name]
+    toy: Entity = env.scene[asset_name]
+    mouth_pos = robot.data.site_pos_w[:, asset_cfg.site_ids[0], :]
+    dist = torch.linalg.norm(mouth_pos - toy.data.root_link_pos_w, dim=-1)
+    proximity = torch.exp(-((dist / std) ** 2))
+    gate = phase_pose_blend(_gp_phase(env, command_name), descent_end, hold_end, rise_end)
+    return gate * torch.nan_to_num(proximity, nan=0.0)
+
+
+def grasp_engage_bonus(env: ManagerBasedRlEnv) -> torch.Tensor:
+    """One-shot +1 on the step the weld engages, 0 on every other step.
+
+    An IMPULSE, not a state bonus, precisely because a per-step "is holding" payout
+    that starts the moment you grab is a jackpot: it would pay more the earlier and
+    therefore the more violently the toy is caught. This pays the same for a grasp
+    at any time, so the shaping that decides *how* to grasp is left to the phase
+    rewards and the impact/regularization penalties.
+    """
+    return _grasp_engaged_now(env).clone()
+
+
+def grasp_held_reward(
+    env: ManagerBasedRlEnv,
+    command_name: str = "twist",
+    hold_end: float = 0.425,
+    rise_end: float = 0.80,
+) -> torch.Tensor:
+    """Binary "toy still held", ramped in over the lift phase.
+
+    Gated by the rise gate rather than always-on so it cannot be farmed by grabbing
+    at t=0 and standing still: the gate is 0 for the whole descent, so early grabs
+    collect nothing extra. During the lift and the standing rest it is the term that
+    makes DROPPING the toy expensive.
+    """
+    gate = phase_rise_gate(_gp_phase(env, command_name), hold_end, rise_end)
+    return gate * _grasp_flag(env).to(torch.float)
+
+
+def toy_lift_progress(
+    env: ManagerBasedRlEnv,
+    asset_name: str = "toy",
+    command_name: str = "twist",
+    hold_end: float = 0.425,
+    rise_end: float = 0.80,
+    max_step: float = 0.02,
+) -> torch.Tensor:
+    """Potential-based lift shaping: the toy's per-step height CHANGE while held.
+
+    Signed on purpose (AGENTS.md "pay delta-progress"): raising the toy pays, holding
+    it pays exactly zero, and lowering it costs back what raising it earned. A
+    height-LEVEL reward would instead pay every step at altitude, which the policy
+    would reach as fast and as hard as it could and then camp on.
+
+    ``max_step`` clips the per-step delta so a physics spike (or the discontinuity of
+    the weld engaging) cannot pay a lump sum.
+    """
+    toy: Entity = env.scene[asset_name]
+    z = torch.nan_to_num(toy.data.root_link_pos_w[:, 2], nan=0.0)
+    prev = _toy_prev_height(env)
+    delta = (z - prev).clamp(-max_step, max_step)
+    prev[:] = z
+    gate = phase_rise_gate(_gp_phase(env, command_name), hold_end, rise_end)
+    return gate * delta * _grasp_flag(env).to(delta.dtype)
+
+
+def toy_carried_height(
+    env: ManagerBasedRlEnv,
+    asset_name: str = "toy",
+    command_name: str = "twist",
+    target_height: float = 0.16,
+    std: float = 0.05,
+    rise_end: float = 0.80,
+) -> torch.Tensor:
+    """Gaussian on the held toy's height, paid only during the standing REST phase.
+
+    This is the terminal "you are standing up holding it" objective. Restricting it
+    to phase >= rise_end keeps it a short window at the end of the cycle instead of
+    a continuously farmable altitude bonus, and requiring ``_grasp_flag`` means a toy
+    thrown upward scores nothing.
+
+    ``target_height`` = 0.16m is the mouth height of a standing Microduck holding
+    something just below the beak (trunk stands at ~0.115m, mouth_tip sits ~0.10m
+    above the trunk at HOME).
+    """
+    toy: Entity = env.scene[asset_name]
+    z = torch.nan_to_num(toy.data.root_link_pos_w[:, 2], nan=0.0)
+    score = torch.exp(-(((z - target_height) / std) ** 2))
+    gate = (_gp_phase(env, command_name) >= rise_end).to(score.dtype)
+    return gate * score * _grasp_flag(env).to(score.dtype)
+
+
+def toy_knocked_away_penalty(
+    env: ManagerBasedRlEnv,
+    asset_name: str = "toy",
+    deadzone: float = 0.01,
+    max_cost: float = 0.2,
+) -> torch.Tensor:
+    """Horizontal distance the toy has been shoved from its spawn while NOT held.
+
+    Returns a cost >= 0 (use a negative weight). This is the term that prices the
+    "just nudge it" failure the roadmap flags for real hardware: a beak that swipes
+    the toy across the floor is strictly worse than one that closes on it. Goes to
+    zero the moment the toy is actually grasped, so carrying it away is free.
+    """
+    toy: Entity = env.scene[asset_name]
+    disp = toy.data.root_link_pos_w[:, :2] - _toy_spawn_pos(env)[:, :2]
+    dist = torch.nan_to_num(torch.linalg.norm(disp, dim=-1), nan=0.0)
+    cost = (dist - deadzone).clamp(0.0, max_cost)
+    return cost * (~_grasp_flag(env)).to(cost.dtype)
+
+
+# ── GraspLift observations (CRITIC-ONLY: the real robot cannot see the toy) ─── #
+
+
+def toy_pos_in_base(
+    env: ManagerBasedRlEnv,
+    asset_name: str = "toy",
+) -> torch.Tensor:
+    """Toy position relative to the robot root, in the robot's base frame.
+
+    CRITIC-ONLY, exactly like ``ball_pos_in_base``: the deployed Microduck has no
+    toy sensing (that is roadmap Phase 4, perception), so the actor must stay blind
+    and rely on placement DR for robustness. The critic may use it to predict the
+    grasp payoff.
+    """
+    robot: Entity = env.scene["robot"]
+    toy: Entity = env.scene[asset_name]
+    rel = toy.data.root_link_pos_w - robot.data.root_link_pos_w
+    rot = matrix_from_quat(robot.data.root_link_quat_w)
+    return torch.bmm(rot.transpose(1, 2), rel.unsqueeze(-1)).squeeze(-1)
+
+
+def toy_vel_in_base(
+    env: ManagerBasedRlEnv,
+    asset_name: str = "toy",
+) -> torch.Tensor:
+    """Toy linear velocity in the robot's base frame. CRITIC-ONLY (see above)."""
+    robot: Entity = env.scene["robot"]
+    toy: Entity = env.scene[asset_name]
+    rot = matrix_from_quat(robot.data.root_link_quat_w)
+    vel = toy.data.root_link_lin_vel_w
+    return torch.bmm(rot.transpose(1, 2), vel.unsqueeze(-1)).squeeze(-1)
+
+
+def grasp_state_obs(env: ManagerBasedRlEnv) -> torch.Tensor:
+    """1.0 while the toy is welded to the beak, else 0.0. CRITIC-ONLY (see above)."""
+    return _grasp_flag(env).to(torch.float).unsqueeze(-1)
