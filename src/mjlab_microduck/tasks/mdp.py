@@ -7736,3 +7736,230 @@ def toy_vel_in_base(
 def grasp_state_obs(env: ManagerBasedRlEnv) -> torch.Tensor:
     """1.0 while the toy is welded to the beak, else 0.0. CRITIC-ONLY (see above)."""
     return _grasp_flag(env).to(torch.float).unsqueeze(-1)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════ #
+# Carry (roadmap Phase 2) — walk while holding a welded toy                       #
+# ═══════════════════════════════════════════════════════════════════════════════ #
+#
+# Phase 2 reuses Phase 1's weld MECHANISM but none of its phase machinery, and the
+# reason is a hard constraint rather than a preference: Phase 1 encodes the pick
+# phase in the twist command slot (`GroundPickPhaseCommand`), Phase 2 needs that
+# same slot for real velocity commands, and the 61D obs contract is shared across
+# the whole policy family so no slot can be added. So the toy is spawned ALREADY
+# welded and `update_grasp_latch` is never registered — Phase 2 is about carrying,
+# not acquiring.
+#
+# Consequence worth stating plainly: a MuJoCo `mjEQ_WELD` does not break, so the
+# toy cannot be dropped. This task is therefore a PERFECT-GRIP UPPER BOUND. It
+# isolates the difficulty the roadmap actually flags (CoM coupling during gait)
+# and deliberately does not model beak grip strength, whose real value is unknown
+# until hardware (roadmap Phase 6). `carried_toy_grip_force` below logs what the
+# weld actually has to carry, so that threshold can later be chosen from data
+# instead of invented.
+
+
+def _carry_prev_toy_vel(env: ManagerBasedRlEnv) -> torch.Tensor:
+    """Per-env toy linear velocity on the previous step (for the accel penalty)."""
+    buf = getattr(env, "_carry_prev_toy_vel", None)
+    if buf is None:
+        buf = torch.zeros(env.num_envs, 3, device=env.device)
+        env._carry_prev_toy_vel = buf
+    return buf
+
+
+@requires_model_fields("eq_data")
+def attach_toy_to_beak(
+    env: ManagerBasedRlEnv,
+    env_ids: torch.Tensor,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot", body_names=["jaw_soft"]),
+    asset_name: str = "toy",
+    offset_in_head: tuple[float, float, float] = (-0.033093, 0.0, -0.077738),
+    refresh_kinematics: bool = True,
+) -> None:
+    """Reset event: spawn the toy already welded to the beak.
+
+    The mirror image of ``reset_grasp``, and Phase 2's replacement for the whole
+    Phase 1 latch: instead of earning the weld by closing the beak on a toy on the
+    floor, the episode STARTS holding it.
+
+    Like ``reset_grasp``, this also carries the ``eq_data`` per-world expansion
+    declaration for the task. ``m.eq_data`` ships as ONE shared row, so without
+    ``@requires_model_fields("eq_data")`` every env would silently be welded with
+    env 0's transform.
+
+    ``offset_in_head`` is the toy's body origin expressed in the head
+    (``jaw_soft``) frame, and the weld's relative rotation is identity, so the toy
+    rides axis-aligned with the head. The default was MEASURED, not chosen: in the
+    head frame +X is world up and -Z is world forward, ``mouth_tip`` sits at
+    (-8.09, 0, -77.74) mm, and sweeping the toy down from there, interpenetration
+    with the head collision mesh falls to exactly zero at 25 mm below the mouth
+    tip (24 mm still overlaps by 0.35 mm). Hanging it there is the carry analogue
+    of where Phase 1's latch fired — Phase 1 welded on CONTACT, i.e. at the same
+    just-touching boundary.
+
+    The kinematics-refresh trap
+    ---------------------------
+    mjlab fires ``mode="reset"`` events from ``_reset_idx``, which runs BEFORE the
+    ``scene.write_data_to_sim()`` / ``sim.forward()`` pair at the end of ``step``.
+    Root pose is readable (the reset events write it straight into the buffer the
+    entity reads back — this is why ``reset_toy_on_ground`` works), but the head is
+    NOT the root: ``xpos``/``xquat`` for ``jaw_soft`` are DERIVED quantities that
+    only update on forward kinematics. Reading them here without a refresh returns
+    the pose from the END OF THE PREVIOUS EPISODE — typically a fallen robot —
+    and the toy gets spawned tens of centimetres from the beak. This is the exact
+    mirror of the Phase 1 sensor-staleness trap in AGENTS.md, and it is silent:
+    the weld is still self-consistent, so nothing errors, the toy is just in the
+    wrong place. ``refresh_kinematics`` flushes and runs FK first so the head pose
+    is real. Keep it on; it exists as a flag only so a test can demonstrate that
+    turning it off actually breaks the placement.
+    """
+    robot: Entity = env.scene[asset_cfg.name]
+    toy: Entity = env.scene[asset_name]
+    eq_id = _grasp_eq_id(env)
+
+    if env_ids is None:
+        env_ids = torch.arange(env.num_envs, device=env.device)
+    env_ids = env_ids.to(env.device)
+    n = int(env_ids.numel())
+    if n == 0:
+        return
+
+    if refresh_kinematics:
+        # Flush this reset's root/joint writes, then run FK so the head pose below
+        # is this episode's, not the last one's. See the trap note above.
+        env.scene.write_data_to_sim()
+        env.sim.forward()
+
+    head_bid = int(robot.indexing.body_ids[asset_cfg.body_ids[0]])
+    x_head = env.sim.data.xpos[env_ids, head_bid]
+    q_head = env.sim.data.xquat[env_ids, head_bid]
+
+    offset = torch.as_tensor(offset_in_head, device=env.device, dtype=x_head.dtype)
+    offset = offset.unsqueeze(0).expand(n, 3)
+
+    # Place the toy where the weld will hold it, so step 0 starts at zero
+    # constraint violation and the weld has nothing to snap.
+    pose = torch.zeros(n, 7, device=env.device, dtype=x_head.dtype)
+    pose[:, :3] = x_head + quat_apply(q_head, offset)
+    pose[:, 3:7] = q_head
+    toy.write_root_link_pose_to_sim(pose, env_ids)
+    toy.write_root_link_velocity_to_sim(
+        torch.zeros(n, 6, device=env.device, dtype=x_head.dtype), env_ids
+    )
+
+    # The weld row is a CONSTANT relative transform (anchor at the toy origin,
+    # relpose = offset, identity relative rotation, full 6-DoF). Deriving it from
+    # world poses like update_grasp_latch does would be equivalent by construction
+    # but would make the weld silently inherit any staleness in x_head/q_head;
+    # written as a constant it is right even if the refresh above ever regresses.
+    data = torch.zeros(n, 11, device=env.device, dtype=x_head.dtype)
+    data[:, 0:3] = 0.0
+    data[:, 3:6] = offset
+    data[:, 6] = 1.0  # identity quaternion, (w, x, y, z)
+    data[:, 10] = 1.0
+    eq_data = env.sim.model.eq_data
+    eq_data[env_ids, eq_id] = data.to(eq_data.dtype)
+
+    env.sim.data.eq_active[env_ids, eq_id] = True
+    _grasp_flag(env)[env_ids] = True
+    _grasp_engaged_now(env)[env_ids] = 0.0
+    _toy_spawn_pos(env)[env_ids] = pose[:, :3]
+    _toy_prev_height(env)[env_ids] = pose[:, 2]
+    _carry_prev_toy_vel(env)[env_ids] = 0.0
+
+
+def carried_toy_accel_penalty(
+    env: ManagerBasedRlEnv,
+    asset_name: str = "toy",
+    free_accel: float = 30.0,
+    max_accel: float = 150.0,
+) -> torch.Tensor:
+    """Penalize only the VIOLENT tail of the carried toy's acceleration.
+
+    Self-negating (returns <= 0) -> use a POSITIVE weight. See the AGENTS.md sign
+    convention: a negative weight here would double-negate into a reward for
+    flinging the toy, which is precisely the behaviour this term exists to stop.
+
+    Why a hinge and not a plain magnitude penalty. Under a permanent weld the toy
+    cannot be dropped, so nothing else stops the policy discovering a head-flinging
+    gait that would tear the toy out of a real beak. But a head that is 38% of body
+    mass MUST oscillate to walk, so the toy MUST accelerate — penalizing |a|
+    directly is the unescapable-tax mistake that made a previous velocity run stand
+    still rather than walk (AGENTS.md; run 5yay13u4). So this charges nothing below
+    ``free_accel`` and rises linearly above it: normal gait oscillation is free, and
+    only the escapable, violent part is priced.
+
+    ``free_accel`` = 30 m/s^2 (~3 g) is a BACKSTOP, not a measured threshold — with
+    no trained carry policy there is no acceleration distribution to fit it to yet.
+    The companion ``carried_toy_accel`` metric logs the actual distribution, so the
+    first run measures what the right value is and it can be set from data. Until
+    then keep the weight small: this is a guard rail, not an objective.
+
+    ``max_accel`` clips the per-step contribution so a solver spike cannot deliver
+    an unbounded punishment.
+    """
+    toy: Entity = env.scene[asset_name]
+    vel = torch.nan_to_num(toy.data.root_link_lin_vel_w, nan=0.0)
+    prev = _carry_prev_toy_vel(env)
+    accel = (vel - prev) / max(float(env.step_dt), 1e-6)
+    prev[:] = vel
+    # A reset teleports the toy, which reads as a huge spurious acceleration.
+    fresh = env.episode_length_buf <= 1
+    mag = torch.linalg.norm(accel, dim=-1)
+    mag = torch.nan_to_num(mag, nan=0.0, posinf=max_accel, neginf=0.0)
+    excess = (mag - free_accel).clamp(0.0, max_accel)
+    excess = torch.where(fresh, torch.zeros_like(excess), excess)
+    return -excess
+
+
+def carried_toy_accel(
+    env: ManagerBasedRlEnv,
+    asset_name: str = "toy",
+) -> torch.Tensor:
+    """Metric: magnitude of the carried toy's acceleration (m/s^2).
+
+    Logged so the first carry run MEASURES the acceleration distribution a real
+    gait produces, instead of the ``free_accel`` hinge in
+    ``carried_toy_accel_penalty`` being guessed forever. Read-only: it reuses the
+    penalty's previous-velocity buffer rather than keeping its own, so it must be
+    evaluated in the same step as the penalty (both run once per step).
+    """
+    toy: Entity = env.scene[asset_name]
+    vel = torch.nan_to_num(toy.data.root_link_lin_vel_w, nan=0.0)
+    accel = (vel - _carry_prev_toy_vel(env)) / max(float(env.step_dt), 1e-6)
+    mag = torch.linalg.norm(accel, dim=-1)
+    return torch.nan_to_num(mag, nan=0.0, posinf=0.0, neginf=0.0)
+
+
+def carried_toy_grip_force(
+    env: ManagerBasedRlEnv,
+    asset_name: str = "toy",
+) -> torch.Tensor:
+    """Metric: force (N) the beak must exert to keep carrying the toy.
+
+    ``m * |a - g|`` for the carried toy — the net force the weld is supplying,
+    which on real hardware is what the beak's grip has to beat. The weld itself
+    never breaks, so this task cannot fail by dropping; logging the force is how a
+    perfect-grip sim run still says something useful about the real robot. When
+    Pancha ships and beak grip strength is measurable (roadmap Phase 6), comparing
+    it against this distribution answers whether the trained gait is carryable
+    without ever having to invent a release threshold here.
+    """
+    toy: Entity = env.scene[asset_name]
+    vel = torch.nan_to_num(toy.data.root_link_lin_vel_w, nan=0.0)
+    accel = (vel - _carry_prev_toy_vel(env)) / max(float(env.step_dt), 1e-6)
+    # Subtract gravity: a body held at rest still needs m*g of grip.
+    gravity = torch.zeros(1, 3, device=env.device, dtype=accel.dtype)
+    gravity[0, 2] = -9.81
+    specific_force = accel - gravity
+
+    # Mass is per-world once the toy-mass DR has expanded body_mass, and a single
+    # shared row before that; handle both rather than assuming an expansion that
+    # only happens when ENABLE_TOY_MASS_RANDOMIZATION is on.
+    toy_bid = int(toy.indexing.root_body_id)
+    body_mass = env.sim.model.body_mass
+    mass = body_mass[:, toy_bid] if body_mass.dim() > 1 else body_mass[toy_bid]
+
+    mag = mass * torch.linalg.norm(specific_force, dim=-1)
+    return torch.nan_to_num(mag, nan=0.0, posinf=0.0, neginf=0.0)

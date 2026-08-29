@@ -39,6 +39,10 @@ from .microduck_grasp_lift_env_cfg import (
     make_microduck_grasp_lift_env_cfg,
     MicroduckGraspLiftRlCfg,
 )
+from .microduck_carry_env_cfg import (
+    make_microduck_carry_env_cfg,
+    MicroduckCarryRlCfg,
+)
 from .microduck_sitstand_env_cfg import (
     make_microduck_sitstand_env_cfg,
     MicroduckSitStandRlCfg,
@@ -180,6 +184,21 @@ register_mjlab_task(
     runner_cls=MicroduckOnPolicyRunner,
 )
 
+# Carry task — roadmap Phase 2: walk under velocity commands while holding the
+# Phase 1 block. Built on the VELOCITY recipe, not grasp_lift: Phase 1 spends the
+# twist command slot on its pick phase and Phase 2 needs that slot for real
+# velocity commands, and the shared 61 D obs contract forbids adding one. The toy
+# is spawned already welded, so this trains carrying rather than acquiring.
+# Flat terrain only — the weld needs scene.spec_fn, which rough terrain uses for
+# contact softening.
+register_mjlab_task(
+    task_id="Mjlab-Carry-Flat-MicroDuck",
+    env_cfg=make_microduck_carry_env_cfg(),
+    play_env_cfg=make_microduck_carry_env_cfg(play=True),
+    rl_cfg=MicroduckCarryRlCfg,
+    runner_cls=MicroduckOnPolicyRunner,
+)
+
 # Roller skate velocity task (passive-wheel model; historical task id kept)
 register_mjlab_task(
     task_id="Mjlab-Velocity-Flat-MicroDuck-Rollers",
@@ -276,6 +295,11 @@ _BACKLASH_TASKS = (
     # real positioning error on a ~10cm neck — this is the A/B that says whether
     # gear backlash breaks the grasp before Pancha ships.
     ("Mjlab-GraspLift-Flat-Backlash-MicroDuck", make_microduck_grasp_lift_env_cfg, {}, MicroduckGraspLiftRlCfg, _BL_ALLCOL),
+    # Carry mirrors its base task's allcollisions model (the carry offset was
+    # measured against that head collision mesh). Backlash matters differently
+    # here than for GraspLift: the toy is welded, so play cannot lose the grasp —
+    # what it perturbs is head positioning under a payload during gait.
+    ("Mjlab-Carry-Flat-Backlash-MicroDuck", make_microduck_carry_env_cfg, {}, MicroduckCarryRlCfg, _BL_ALLCOL),
     ("Mjlab-Velocity-Flat-Backlash-MicroDuck-Rollers", make_microduck_velocity_rollers_env_cfg, {}, MicroduckRollersRlCfg, _BL_ROLLERS),
     ("Mjlab-Velocity-Swizzle-Backlash-MicroDuck", make_microduck_velocity_swizzle_env_cfg, {}, MicroduckSwizzleRlCfg, _BL_ROLLERS),
     ("Mjlab-RollerCrouch-Flat-Backlash-MicroDuck", make_microduck_roller_crouch_env_cfg, {}, MicroduckRollerCrouchRlCfg, _BL_ROLLERS),
