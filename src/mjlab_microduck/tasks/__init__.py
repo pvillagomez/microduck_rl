@@ -271,6 +271,11 @@ _BACKLASH_TASKS = (
     ("Mjlab-GroundPick-Flat-Backlash-MicroDuck", make_microduck_ground_pick_env_cfg, {}, MicroduckGroundPickRlCfg, _BL_ALLCOL),
     ("Mjlab-GroundPick-Rough-Backlash-MicroDuck", make_microduck_ground_pick_env_cfg, {"rough": True}, MicroduckGroundPickRlCfg, _BL_ALLCOL),
     ("Mjlab-BallKick-Flat-Backlash-MicroDuck", make_microduck_ball_kick_env_cfg, {}, MicroduckBallKickRlCfg, _BL_ALLCOL),
+    # GraspLift mirrors its base task's allcollisions model. Worth having: the
+    # grasp gate gives the beak a 35mm window, and ±1° of play per servo is a
+    # real positioning error on a ~10cm neck — this is the A/B that says whether
+    # gear backlash breaks the grasp before Pancha ships.
+    ("Mjlab-GraspLift-Flat-Backlash-MicroDuck", make_microduck_grasp_lift_env_cfg, {}, MicroduckGraspLiftRlCfg, _BL_ALLCOL),
     ("Mjlab-Velocity-Flat-Backlash-MicroDuck-Rollers", make_microduck_velocity_rollers_env_cfg, {}, MicroduckRollersRlCfg, _BL_ROLLERS),
     ("Mjlab-Velocity-Swizzle-Backlash-MicroDuck", make_microduck_velocity_swizzle_env_cfg, {}, MicroduckSwizzleRlCfg, _BL_ROLLERS),
     ("Mjlab-RollerCrouch-Flat-Backlash-MicroDuck", make_microduck_roller_crouch_env_cfg, {}, MicroduckRollerCrouchRlCfg, _BL_ROLLERS),

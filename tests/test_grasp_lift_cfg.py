@@ -8,6 +8,7 @@ beak. The physics of the weld itself is checked in
 """
 
 import math
+from pathlib import Path
 
 import mujoco
 import numpy as np
@@ -194,6 +195,8 @@ def test_flat_terrain_only():
 
 
 def _compiled_scene():
+    from copy import deepcopy
+
     from mjlab.scene import Scene, SceneCfg
     from mjlab.terrains.terrain_entity import TerrainEntityCfg
 
@@ -203,11 +206,20 @@ def _compiled_scene():
     )
     from mjlab_microduck.tasks.mdp import make_grasp_weld_spec_fn
 
+    # Deepcopy the entity cfgs: building an Entity edits its cfg in place (spec
+    # editors, actuators, collisions), and these are the module-level singletons
+    # the registered tasks also reference. Without this, compiling a scene here
+    # leaks into every later test — it silently broke head/toy contact and made
+    # the integration test below fail only when run after these.
+    entities = {
+        "robot": deepcopy(MICRODUCK_GRASP_LIFT_ROBOT_CFG),
+        "toy": deepcopy(MICRODUCK_TOY_CFG),
+    }
     scene = Scene(
         SceneCfg(
             num_envs=1,
             terrain=TerrainEntityCfg(terrain_type="plane"),
-            entities={"robot": MICRODUCK_GRASP_LIFT_ROBOT_CFG, "toy": MICRODUCK_TOY_CFG},
+            entities=entities,
             spec_fn=make_grasp_weld_spec_fn(),
         ),
         device="cpu",
@@ -319,3 +331,227 @@ def test_grasp_weld_holds_object():
     for _ in range(1500):
         mujoco.mj_step(model, data)
     assert data.xpos[toy][2] < 0.03, "toy did not fall after the weld was released"
+
+
+# ── Backlash variant ─────────────────────────────────────────────────────────
+
+
+def test_backlash_variant_keeps_toy_and_weld():
+    """The backlash twin must keep the toy entity AND a resolvable grasp weld.
+
+    ``make_backlash_variant`` swaps only the ``robot`` key, so a second entity and
+    ``scene.spec_fn`` survive by construction — but nothing else in the repo has a
+    multi-entity backlash task, so this locks that in. Compiling the scene is the
+    part that matters: the weld addresses bodies by prefixed name, so if the
+    backlash export ever renamed ``jaw_soft`` the equality would silently fail to
+    resolve and the task would train with no grasp at all.
+    """
+    from mjlab.scene import Scene, SceneCfg
+    from mjlab.tasks.registry import load_env_cfg
+    from mjlab.terrains.terrain_entity import TerrainEntityCfg
+
+    cfg = load_env_cfg("Mjlab-GraspLift-Flat-Backlash-MicroDuck")
+    # Robot MUST stay first: base reset events write robot root at qpos[:, 0:7].
+    assert list(cfg.scene.entities.keys()) == ["robot", "toy"]
+    assert cfg.scene.spec_fn is not None
+
+    # cfg came from load_env_cfg, which deep-copies, so building a Scene from it
+    # cannot leak into the shared entity cfgs (see _compiled_scene).
+    model = Scene(
+        SceneCfg(
+            num_envs=1,
+            terrain=TerrainEntityCfg(terrain_type="plane"),
+            entities=cfg.scene.entities,
+            spec_fn=cfg.scene.spec_fn,
+        ),
+        device="cpu",
+    ).compile()
+
+    eq = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_EQUALITY, GRASP_WELD_NAME)
+    assert eq >= 0, "grasp weld did not resolve on the backlash model"
+    assert model.eq_obj1id[eq] == mujoco.mj_name2id(
+        model, mujoco.mjtObj.mjOBJ_BODY, "robot/jaw_soft"
+    )
+    assert model.eq_obj2id[eq] == mujoco.mj_name2id(
+        model, mujoco.mjtObj.mjOBJ_BODY, "toy/toy"
+    )
+    assert not model.eq_active0[eq]
+
+    # Backlash joints ride their hard limits by design and must be excluded from
+    # the soft-limit penalty, or it fires permanently.
+    assert cfg.rewards["dof_pos_limits"].params["asset_cfg"].joint_names == (
+        r"^(?!passive_).*",
+    )
+
+
+def test_backlash_variant_mirrors_base_robot_model():
+    """AGENTS.md invariant: a -Backlash- variant mirrors its base task's model.
+
+    GraspLift runs on allcollisions, so its twin must use the allcollisions
+    backlash robot — a walk-model twin would confound any backlash A/B with a
+    collision-model change.
+    """
+    from mjlab.tasks.registry import load_env_cfg
+
+    from mjlab_microduck.robot.microduck_constants import get_backlash_spec
+
+    cfg = load_env_cfg("Mjlab-GraspLift-Flat-Backlash-MicroDuck")
+    # load_env_cfg deep-copies, so identity against the cfg object is meaningless;
+    # spec_fn survives the copy and pins the actual XML that gets compiled.
+    assert cfg.scene.entities["robot"].spec_fn is get_backlash_spec
+
+
+def test_backlash_variant_preserves_the_61d_obs_contract():
+    """Obs/action dims must be unchanged: 14 servo joints, 61 D actor.
+
+    The backlash model carries 28 joints (14 servo + 14 passive backlash hinges);
+    if those leaked into the joint obs the actor would blow past 61 D and stop
+    being hot-swappable against the rest of the policy family.
+    """
+    from mjlab.tasks.registry import load_env_cfg
+
+    cfg = load_env_cfg("Mjlab-GraspLift-Flat-Backlash-MicroDuck")
+    for group in ("actor", "critic"):
+        for term in ("joint_pos", "joint_vel"):
+            sel = cfg.observations[group].terms[term].params["asset_cfg"].joint_names
+            assert sel == (r"^(?!passive_).*",), (
+                f"{group}.{term} would include the backlash hinges"
+            )
+
+
+def test_grasp_weld_data_satisfies_the_weld_constraint():
+    """The SHIPPED weld maths must zero MuJoCo's weld residual.
+
+    ``update_grasp_latch`` writes ``eq_data`` via ``_grasp_weld_data``; this checks
+    that exact function against MuJoCo's own definition of a satisfied weld:
+
+        pos1 = x_head + R_head @ data[3:6]  ==  pos2 = x_toy + R_toy @ data[0:3]
+        q_head * data[6:10]                 ==  q_toy
+
+    Deliberately asserts the CONSTRAINT rather than re-deriving the terms. An
+    earlier version of this file recomputed the anchors independently, which meant
+    a wrong call site in the shipped code still passed — mutation testing caught
+    that (breaking the anchor write went undetected).
+    """
+    import torch
+    from mjlab.utils.lab_api.math import matrix_from_quat, quat_mul
+
+    from mjlab_microduck.tasks.mdp import _grasp_weld_data
+
+    torch.manual_seed(0)
+    n = 16
+    q_head = torch.nn.functional.normalize(torch.randn(n, 4), dim=-1)
+    q_toy = torch.nn.functional.normalize(torch.randn(n, 4), dim=-1)
+    x_head = torch.randn(n, 3)
+    x_toy = torch.randn(n, 3)
+
+    data = _grasp_weld_data(q_head, x_head, q_toy, x_toy)
+    assert data.shape == (n, 11)
+    assert torch.allclose(data[:, 10], torch.ones(n)), "torquescale must be 1 (6-DoF weld)"
+
+    r_head = matrix_from_quat(q_head)
+    r_toy = matrix_from_quat(q_toy)
+    pos1 = x_head + torch.bmm(r_head, data[:, 3:6].unsqueeze(-1)).squeeze(-1)
+    pos2 = x_toy + torch.bmm(r_toy, data[:, 0:3].unsqueeze(-1)).squeeze(-1)
+    assert torch.allclose(pos1, pos2, atol=1e-5), "weld position residual is non-zero"
+
+    q_pred = quat_mul(q_head, data[:, 6:10])
+    # Quaternions double-cover rotations, so q and -q are the same orientation.
+    aligned = torch.minimum((q_pred - q_toy).abs().max(dim=-1).values,
+                            (q_pred + q_toy).abs().max(dim=-1).values)
+    assert torch.all(aligned < 1e-5), "weld orientation residual is non-zero"
+
+
+def test_latch_engages_and_the_toy_physically_follows_the_beak():
+    """End-to-end: stepping the env must actually engage the weld and hold the toy.
+
+    Slower than the rest of this file (it instantiates the env) but it covers the
+    one thing config assertions cannot: the runtime side-effect of the latch. If
+    ``update_grasp_latch`` wrote ``eq_data`` and never set ``eq_active``, every
+    config test here would still pass while the grasp silently never engaged — a
+    task that can never succeed, discovered only after paying for a training run.
+    Mutation testing found exactly that hole.
+
+    Drives the real integration path (``env.step`` -> registered "step" event)
+    rather than calling the latch directly, because the contact gate reads sensor
+    data that only refreshes inside the decimation loop.
+    """
+    import torch
+    from mjlab.envs import ManagerBasedRlEnv
+    from mjlab.tasks.registry import load_env_cfg
+
+    from mjlab_microduck.tasks.mdp import _grasp_eq_id, _grasp_flag
+
+    cfg = load_env_cfg("Mjlab-GraspLift-Flat-MicroDuck")
+    cfg.scene.num_envs = 2
+    # Seed it: spawn placement, CoM randomization and pushes are all random, and
+    # an unseeded run makes this test flaky rather than wrong.
+    cfg.seed = 0
+    env = ManagerBasedRlEnv(cfg=cfg, device="cpu")
+    try:
+        env.reset()
+        action = torch.zeros(env.num_envs, env.action_manager.total_action_dim)
+        for _ in range(3):
+            env.step(action)
+
+        robot, toy = env.scene["robot"], env.scene["toy"]
+        joints, sites = list(robot.joint_names), list(robot.site_names)
+        qadr = robot.indexing.joint_q_adr
+        mouth = sites.index("mouth_tip")
+
+        # Point the beak at the floor and place the toy in it: satisfies the
+        # proximity, alignment and (via the resulting overlap) contact gates.
+        for name, value in (("neck_pitch", -1.35), ("head_pitch", 0.30)):
+            env.sim.data.qpos[:, qadr[joints.index(name)]] = value
+        env.sim.forward()
+        pose = torch.zeros(env.num_envs, 7)
+        pose[:, :3] = robot.data.site_pos_w[:, mouth, :]
+        pose[:, 3] = 1.0
+        toy.write_root_link_pose_to_sim(pose)
+        toy.write_root_link_velocity_to_sim(torch.zeros(env.num_envs, 6))
+        env.sim.forward()
+
+        assert not bool(_grasp_flag(env).any()), "nothing should be held yet"
+
+        # Hold the toy in the beak for a few steps rather than one, and give it the
+        # BEAK's velocity rather than zero. Under zero actions the robot is falling
+        # at ~0.5 m/s, and a toy pinned at zero velocity is something the head is
+        # slapping through — which the latch's relative-speed gate correctly
+        # refuses. Matching velocities is the physically meaningful setup: beak and
+        # object moving together, in contact, mouth down.
+        for _ in range(10):
+            pose[:, :3] = robot.data.site_pos_w[:, mouth, :]
+            vel = torch.zeros(env.num_envs, 6)
+            vel[:, :3] = robot.data.site_lin_vel_w[:, mouth, :]
+            toy.write_root_link_pose_to_sim(pose)
+            toy.write_root_link_velocity_to_sim(vel)
+            env.sim.forward()
+            env.step(action)
+            if bool(_grasp_flag(env).all()):
+                break
+
+        assert bool(_grasp_flag(env).all()), "the latch did not engage"
+        assert bool(
+            env.sim.data.eq_active[:, _grasp_eq_id(env)].all()
+        ), "eq_active was never set — the weld is inert"
+
+        # The decisive physical check: with the weld truly active the toy tracks
+        # the beak. Guarded on episode end — the robot is falling under zero
+        # actions, and a fell_over reset legitimately RELEASES the weld and
+        # re-spawns the toy on the floor, which would read as a huge false "slip".
+        offset = (toy.data.root_link_pos_w - robot.data.site_pos_w[:, mouth, :]).clone()
+        steps = 0
+        for _ in range(8):
+            _, _, terminated, timed_out, _ = env.step(action)
+            if bool((terminated | timed_out).any()):
+                break
+            steps += 1
+            drift = torch.linalg.norm(
+                (toy.data.root_link_pos_w - robot.data.site_pos_w[:, mouth, :]) - offset,
+                dim=-1,
+            )
+            assert bool((drift < 0.01).all()), f"toy slipped out of the beak: {drift}"
+        assert steps > 0, "episode ended before the weld could be observed holding"
+        assert bool(torch.isfinite(env.sim.data.qpos).all())
+    finally:
+        env.close()
